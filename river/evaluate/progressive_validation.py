@@ -9,6 +9,24 @@ from river import base, metrics, stream, utils
 
 __all__ = ["progressive_val_score"]
 
+_FEATURE_VIEWS = ("arrival", "prediction")
+
+
+def _check_feature_view(feature_view: str) -> None:
+    if feature_view not in _FEATURE_VIEWS:
+        raise ValueError(f"feature_view must be one of {_FEATURE_VIEWS}, got {feature_view!r}")
+
+
+def _supports_prediction_view(model, pred_func_name: str) -> bool:
+    required = ("learn_one_from_context", "discard_context", f"{pred_func_name}_with_context")
+    return all(callable(getattr(model, method, None)) for method in required)
+
+
+def _feature_view_prediction(model, x, pred_func_name, params):
+    """Make a prediction with a context, returning (prediction, context)."""
+    method = getattr(model, f"{pred_func_name}_with_context")
+    return method(x, **params)
+
 
 def _progressive_validation(
     dataset: base.typing.Dataset,
@@ -20,18 +38,44 @@ def _progressive_validation(
     measure_time=False,
     measure_memory=False,
     yield_predictions=False,
+    feature_view: str = "arrival",
 ):
+    _check_feature_view(feature_view)
+
     # Check that the model and the metric are in accordance
     if not metric.works_with(model):
         raise ValueError(f"{metric.__class__.__name__} metric is not compatible with {model}")
 
     # Determine if predict_one or predict_proba_one should be used in case of a classifier
     if utils.inspect.isanomalydetector(model) or utils.inspect.isanomalyfilter(model):
-        pred_func = model.score_one
+        pred_func_name = "score_one"
     elif utils.inspect.isclassifier(model) and not metric.requires_labels:  # type: ignore
-        pred_func = model.predict_proba_one
+        pred_func_name = "predict_proba_one"
     else:
-        pred_func = model.predict_one
+        pred_func_name = "predict_one"
+
+    if feature_view == "prediction":
+        if not _supports_prediction_view(model, pred_func_name):
+            raise ValueError(
+                "feature_view='prediction' requires a compose.Pipeline supporting the "
+                "prediction-context protocol (predict_*_with_context / "
+                "learn_one_from_context / discard_context); "
+                f"{model!r} does not"
+            )
+        if (
+            utils.inspect.isanomalydetector(model)
+            or utils.inspect.isanomalyfilter(model)
+            or utils.inspect.isactivelearner(model)
+        ):
+            raise ValueError(
+                "feature_view='prediction' does not support anomaly filters, anomaly "
+                f"detectors, or active learners; {model!r} uses one of them"
+            )
+        # Let the pipeline perform its own structural validation now, before the dataset
+        # is touched (nested anomaly filters, shared stateful instances, etc.).
+        validate = getattr(model, "_check_context_support", None)
+        if callable(validate):
+            validate(pred_func_name)
 
     preds = {}
 
@@ -64,43 +108,83 @@ def _progressive_validation(
 
         return state
 
-    for i, x, y, *kwargs in stream.simulate_qa(dataset, moment, delay, copy=True):
-        kwargs = kwargs[0] if kwargs else {}
+    def run_events():
+        nonlocal n_total_answers, prev_checkpoint, next_checkpoint, n_samples_learned
 
-        # Case 1: no ground truth, just make a prediction
-        if y is None:
-            y_pred = pred_func(x, **kwargs)
-            y_pred, ask_for_label = y_pred if active_learning else (y_pred, True)
-            if utils.inspect.isanomalyfilter(model):
-                y_pred = model.classify(y_pred)
-            preds[i] = y_pred, ask_for_label
-            continue
+        events = stream.simulate_qa(dataset, moment, delay, copy=True)
+        try:
+            for i, x, y, *kwargs in events:
+                kwargs = kwargs[0] if kwargs else {}
 
-        # Case 2: there's a ground truth, model and metric can be updated
-        y_pred, use_label = preds.pop(i)
+                # Case 1: no ground truth, just make a prediction
+                if y is None:
+                    if feature_view == "prediction":
+                        y_pred, context = _feature_view_prediction(model, x, pred_func_name, kwargs)
+                        preds[i] = (y_pred, True, context)
+                    else:
+                        y_pred = getattr(model, pred_func_name)(x, **kwargs)
+                        y_pred, ask_for_label = y_pred if active_learning else (y_pred, True)
+                        if utils.inspect.isanomalyfilter(model):
+                            y_pred = model.classify(y_pred)
+                        preds[i] = (y_pred, ask_for_label, None)
+                    continue
 
-        # Update the metric
-        if y_pred != {} and y_pred is not None:
-            metric.update(y_true=y, y_pred=y_pred)
+                # Case 2: there's a ground truth, model and metric can be updated
+                y_pred, use_label, context = preds.pop(i)
 
-        # Update the model
-        if use_label:
-            n_samples_learned += 1
-            if model._supervised:
-                model.learn_one(x, y, **kwargs)
+                # Update the metric. This happens at the answer event, using the
+                # prediction that was actually issued.
+                if y_pred != {} and y_pred is not None:
+                    metric.update(y_true=y, y_pred=y_pred)
+
+                # Update the model
+                if use_label:
+                    n_samples_learned += 1
+                    if feature_view == "prediction":
+                        # The failure already terminated the context; discarding is a no-op
+                        # and keeps the evaluator's own bookkeeping in sync.
+                        try:
+                            model.learn_one_from_context(context, y, **kwargs)
+                        finally:
+                            model.discard_context(context)
+                    elif model._supervised:
+                        model.learn_one(x, y, **kwargs)
+                    else:
+                        model.learn_one(x, **kwargs)
+
+                # Yield current results
+                n_total_answers += 1
+                if n_total_answers == next_checkpoint:
+                    yield report(y_pred=y_pred)
+                    prev_checkpoint = next_checkpoint
+                    next_checkpoint = next(checkpoints, None)
             else:
-                model.learn_one(x, **kwargs)
+                # If the dataset was exhausted, we need to make sure that we yield the final
+                # results
+                if prev_checkpoint and n_total_answers != prev_checkpoint:
+                    yield report(y_pred=None)
+        finally:
+            # Release every context this evaluator still owns, as well as the input
+            # iterator. This runs on normal exhaustion, on error, and on an explicit
+            # ``close()`` of the generator.
+            try:
+                if feature_view == "prediction":
+                    for _, _, context in list(preds.values()):
+                        try:
+                            model.discard_context(context)
+                        except ValueError:
+                            # Already terminated elsewhere; nothing left to release.
+                            pass
+                preds.clear()
+            finally:
+                close = getattr(events, "close", None)
+                if callable(close):
+                    close()
+                close = getattr(dataset, "close", None)
+                if callable(close):
+                    close()
 
-        # Yield current results
-        n_total_answers += 1
-        if n_total_answers == next_checkpoint:
-            yield report(y_pred=y_pred)
-            prev_checkpoint = next_checkpoint
-            next_checkpoint = next(checkpoints, None)
-    else:
-        # If the dataset was exhausted, we need to make sure that we yield the final results
-        if prev_checkpoint and n_total_answers != prev_checkpoint:
-            yield report(y_pred=None)
+    yield from run_events()
 
 
 def iter_progressive_val_score(
@@ -113,6 +197,7 @@ def iter_progressive_val_score(
     measure_time=False,
     measure_memory=False,
     yield_predictions=False,
+    feature_view: str = "arrival",
 ) -> typing.Generator:
     """Evaluates the performance of a model on a streaming dataset and yields results.
 
@@ -151,6 +236,18 @@ def iter_progressive_val_score(
     yield_predictions
         Whether or not to include predictions. If step is 1, then this is equivalent to yielding
         the predictions at every iterations. Otherwise, not all predictions will be yielded.
+    feature_view
+        How features are presented to the model when it learns.
+
+        - ``'arrival'`` (default) transforms the features when the observation arrives and
+          learns with the arrival-time features, exactly as before.
+        - ``'prediction'`` keeps the feature values that were actually used to make each
+          prediction, and feeds them back when the label arrives. This requires a
+          ``compose.Pipeline`` that supports the prediction-context protocol, and is
+          rejected (before the dataset is consumed) otherwise.
+
+        In both modes the metric is updated only at answer events, with the prediction that
+        was actually issued.
 
     Examples
     --------
@@ -225,6 +322,7 @@ def iter_progressive_val_score(
         measure_time=measure_time,
         measure_memory=measure_memory,
         yield_predictions=yield_predictions,
+        feature_view=feature_view,
     )
 
 
@@ -237,6 +335,7 @@ def progressive_val_score(
     print_every=0,
     show_time=False,
     show_memory=False,
+    feature_view: str = "arrival",
     **print_kwargs,
 ) -> metrics.base.Metric:
     """Evaluates the performance of a model on a streaming dataset.
@@ -287,6 +386,14 @@ def progressive_val_score(
         Whether or not to display the elapsed time.
     show_memory
         Whether or not to display the memory usage of the model.
+    feature_view
+        How features are presented to the model when it learns. ``'arrival'`` (the default)
+        preserves the historical behaviour: features are transformed when the observation
+        arrives, and the model learns with those arrival-time values. ``'prediction'`` uses
+        `compose.Pipeline`'s two-phase context protocol so that each model update is fed
+        the exact features that were used for the prediction, which matters when
+        transformers evolve between the question and the answer. The latter requires a
+        supported pipeline and is rejected before any data is consumed otherwise.
     print_kwargs
         Extra keyword arguments are passed to the `print` function. For instance, this allows
         providing a `file` argument, which indicates where to output progress.
@@ -374,6 +481,24 @@ def progressive_val_score(
 
     >>> import os; os.remove('progress.log')
 
+    The ``feature_view`` parameter controls which features the model learns with. By
+    default (``'arrival'``) features are transformed when the observation arrives. With
+    ``'prediction'``, each update uses the features that were actually used for the
+    prediction, even if transformers changed while the label was in flight:
+
+    >>> model = (
+    ...     preprocessing.StandardScaler() |
+    ...     linear_model.LinearRegression()
+    ... )
+    >>> metric = evaluate.progressive_val_score(
+    ...     model=model,
+    ...     dataset=[({'x': i}, i) for i in range(20)],
+    ...     metric=metrics.MAE(),
+    ...     feature_view='prediction',
+    ... )
+    >>> metric.get() >= 0
+    True
+
     References
     ----------
     [^1]: [Beating the Hold-Out: Bounds for K-fold and Progressive Cross-Validation](http://hunch.net/~jl/projects/prediction_bounds/progressive_validation/coltfinal.pdf)
@@ -390,20 +515,28 @@ def progressive_val_score(
         step=print_every,
         measure_time=show_time,
         measure_memory=show_memory,
+        feature_view=feature_view,
     )
 
     active_learning = utils.inspect.isactivelearner(model)
 
-    for checkpoint in checkpoints:
-        msg = f"[{checkpoint['Step']:,d}] {metric}"
-        if active_learning:
-            msg += f" – {checkpoint['Samples used']:,d} samples used"
-        if show_time:
-            H, rem = divmod(checkpoint["Time"].seconds, 3600)
-            M, S = divmod(rem, 60)
-            msg += f" – {H:02d}:{M:02d}:{S:02d}"
-        if show_memory:
-            msg += f" – {utils.pretty.humanize_bytes(checkpoint['Memory'])}"
-        print(msg, **print_kwargs)
+    try:
+        for checkpoint in checkpoints:
+            msg = f"[{checkpoint['Step']:,d}] {metric}"
+            if active_learning:
+                msg += f" – {checkpoint['Samples used']:,d} samples used"
+            if show_time:
+                H, rem = divmod(checkpoint["Time"].seconds, 3600)
+                M, S = divmod(rem, 60)
+                msg += f" – {H:02d}:{M:02d}:{S:02d}"
+            if show_memory:
+                msg += f" – {utils.pretty.humanize_bytes(checkpoint['Memory'])}"
+            print(msg, **print_kwargs)
+    finally:
+        # Closing the checkpoint generator releases the evaluator's pending contexts and
+        # input iterator, both on normal completion and on an exception.
+        close = getattr(checkpoints, "close", None)
+        if callable(close):
+            close()
 
     return metric

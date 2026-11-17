@@ -2,6 +2,7 @@ title: Recipes 🌮
 nav:
     - reading-data.md
     - model-evaluation.md
+    - delayed-feedback.ipynb
     - pipelines.md
     - feature-extraction.md
     - hyperparameter-tuning.md
