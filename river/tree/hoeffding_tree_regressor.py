@@ -5,9 +5,16 @@ from copy import deepcopy
 from river import base, linear_model
 
 from .hoeffding_tree import HoeffdingTree
+from .monotonic import (
+    MonotonicTreeCoordinator,
+    validate_constraint_config,
+    validate_learn_input,
+    validate_predict_input,
+)
 from .nodes.branch import DTBranch
 from .nodes.htr_nodes import LeafAdaptive, LeafMean, LeafModel
 from .nodes.leaf import HTLeaf
+from .nodes.mono_htr_nodes import MonoLeafMean
 from .split_criterion import VarianceReductionSplitCriterion
 from .splitter import Splitter, TEBSTSplitter
 
@@ -67,6 +74,27 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
         If True, disable poor attributes to reduce memory usage.
     merit_preprune
         If True, enable merit-based tree pre-pruning.
+    monotonic_cst
+        Feature-wise monotonic constraints. A mapping from feature names to one of the
+        Python integers ``-1``, ``0`` or ``1`` (booleans are not accepted):
+
+        - ``1`` forces a non-decreasing relationship between the feature and the
+          prediction,
+        - ``-1`` forces a non-increasing relationship,
+        - ``0`` leaves the feature unconstrained.
+
+        ``None``, an empty mapping or an all-zero mapping keep the tree unconstrained.
+        When at least one constraint is active, only ``leaf_prediction='mean'`` and
+        ``binary_split=True`` are supported; every other combination raises a
+        ``ValueError`` before training starts. Declaring a constrained feature as a
+        nominal attribute is likewise rejected. The provided mapping is copied, so
+        changing it after constructing the tree has no effect.
+
+        The constraint is enforced at every step of the online learning process: split
+        candidates that would violate a direction are rejected, leaf predictions are
+        projected onto feasible monotonic intervals, and every prediction made after
+        each learned sample honors the constraints on the whole feature space, not only
+        on observed samples.
 
     Notes
     -----
@@ -127,7 +155,32 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
         stop_mem_management: bool = False,
         remove_poor_attrs: bool = False,
         merit_preprune: bool = True,
+        monotonic_cst: dict | None = None,
     ):
+        # Validate and normalize the constraints before mutating any state. The mapping is
+        # copied internally; the caller's object is never stored or modified.
+        self._monotonic_cst = validate_constraint_config(monotonic_cst)
+        self._mono_active = self._monotonic_cst is not None
+
+        if self._mono_active:
+            if leaf_prediction != self._TARGET_MEAN:
+                raise ValueError(
+                    "Monotonic constraints require leaf_prediction='mean'; got "
+                    f"{leaf_prediction!r}."
+                )
+            if not binary_split:
+                raise ValueError(
+                    "Monotonic constraints require binary_split=True; multi-way splits "
+                    "are not supported."
+                )
+            constrained_names = {name for name, _ in self._monotonic_cst}
+            if nominal_attributes and constrained_names.intersection(nominal_attributes):
+                conflict = constrained_names.intersection(nominal_attributes)
+                raise ValueError(
+                    "Features cannot be both monotonic-constrained and nominal: "
+                    f"{sorted(conflict)}."
+                )
+
         super().__init__(
             max_depth=max_depth,
             binary_split=binary_split,
@@ -147,6 +200,7 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
         self.model_selector_decay = model_selector_decay
         self.nominal_attributes = nominal_attributes
         self.min_samples_split = min_samples_split
+        self.monotonic_cst = monotonic_cst
 
         if splitter is None:
             self.splitter = TEBSTSplitter()
@@ -154,6 +208,27 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
             if splitter.is_target_class:
                 raise ValueError("The chosen splitter cannot be used in regression tasks.")
             self.splitter = splitter  # type: ignore
+
+        if self._mono_active:
+            self._mono_coordinator = MonotonicTreeCoordinator(self._monotonic_cst)
+            # Per-sample bookkeeping used to trigger coordination only when necessary:
+            # leaves whose statistics changed and a flag for topology changes.
+            self._mono_touched_leaves = []
+            self._mono_structure_dirty = False
+        else:
+            self._mono_coordinator = None
+
+    def _mono_touch(self, leaf):
+        """Record that ``leaf`` absorbed a (possibly weighted) sample."""
+        self._mono_touched_leaves.append(leaf)
+
+    def _mono_mark_structure_change(self):
+        self._mono_structure_dirty = True
+
+    @property
+    def monotonic_constraints(self):
+        """Normalized immutable constraint mapping, or ``None`` when unconstrained."""
+        return self._monotonic_cst
 
     @property
     def _mutable_attributes(self):
@@ -205,7 +280,16 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
                     leaf_model = deepcopy(self.leaf_model)
 
         if self.leaf_prediction == self._TARGET_MEAN:
-            return LeafMean(initial_stats, depth, self.splitter)
+            if self._mono_active:
+                leaf = MonoLeafMean(initial_stats, depth, self.splitter)
+            else:
+                leaf = LeafMean(initial_stats, depth, self.splitter)
+            if self._mono_active and initial_stats is None:
+                # Brand new region whose box is inherited from the split hook; the root leaf
+                # gets the full unconstrained box.
+                if parent is None:
+                    self._mono_coordinator.register_leaf(leaf)
+            return leaf
         elif self.leaf_prediction == self._MODEL:
             return LeafModel(initial_stats, depth, self.splitter, leaf_model)
         else:  # adaptive learning node
@@ -230,11 +314,24 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
 
         """
 
+        if self._mono_active:
+            # All validation happens before any state (tree, counters, RNG or drift state)
+            # is touched, so rejected inputs have no side effects.
+            validate_learn_input(x, y, w, self._monotonic_cst)
+            if w == 0.0:
+                # A zero-weight sample carries no mass: nothing in the model changes.
+                return
+            self._mono_touched_leaves = []
+            self._mono_structure_dirty = False
+
         self._train_weight_seen_by_model += w
 
         if self._root is None:
             self._root = self._new_leaf()
             self._n_active_leaves = 1
+            if self._mono_active:
+                # The first root leaf spans the whole, unconstrained region.
+                self._mono_coordinator.register_leaf(self._root)
 
         p_node = None
         node = None
@@ -286,6 +383,9 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
             # Learn from the sample
             node.learn_one(x, y, w=w, tree=self)
 
+        if self._mono_active:
+            self._mono_reconcile()
+
         if self._train_weight_seen_by_model % self.memory_estimate_period == 0:
             self._estimate_model_size()
 
@@ -302,6 +402,9 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
         Predicted target value.
 
         """
+        if self._mono_active:
+            validate_predict_input(x, self._monotonic_cst)
+
         pred = 0.0
         if self._root is not None:
             if isinstance(self._root, DTBranch):
@@ -342,6 +445,16 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
         """
         split_criterion = self._new_split_criterion()
         best_split_suggestions = leaf.best_split_suggestions(split_criterion, self)
+        if self._mono_active:
+            # Keep only splits compatible with the constrained directions. A split on a
+            # constrained feature is feasible when the child means observed so far already
+            # respect the required ordering; the global coordinator then re-enforces the
+            # full partial order on the new leaves.
+            best_split_suggestions = [
+                suggestion
+                for suggestion in best_split_suggestions
+                if self._mono_split_feasible(leaf, suggestion)
+            ]
         best_split_suggestions.sort()
         should_split = False
         if len(best_split_suggestions) < 2:
@@ -400,6 +513,10 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
                 else:
                     parent.children[parent_branch] = new_split
 
+                if self._mono_active:
+                    # Register the new regions and re-solve the global monotonic program.
+                    self._mono_register_split(leaf, new_split, leaves, split_decision)
+
             # Manage memory
             self._enforce_size_limit()
         elif (
@@ -413,3 +530,64 @@ class HoeffdingTreeRegressor(HoeffdingTree, base.Regressor):
             leaf.manage_memory(  # type: ignore
                 split_criterion, last_check_ratio, last_check_vr, hoeffding_bound
             )
+
+    # ------------------------------------------------------------------
+    # Monotonic constraint hooks
+    # ------------------------------------------------------------------
+    def _mono_direction(self, feature):
+        for name, direction in self._monotonic_cst:
+            if name == feature:
+                return direction
+        return None
+
+    def _mono_split_feasible(self, leaf, suggestion):
+        """Check whether a split candidate is compatible with the constrained directions."""
+        if suggestion.feature is None:
+            # Null split: always feasible.
+            return True
+        direction = self._mono_direction(suggestion.feature)
+        if direction is None:
+            # Unconstrained features may split freely; they still participate in the
+            # feasible interval system through their shared parent region.
+            return True
+
+        children_stats = suggestion.children_stats
+        if children_stats is None or len(children_stats) != 2:
+            return False
+
+        left_mean = children_stats[0].mean.get()
+        right_mean = children_stats[1].mean.get()
+        if direction == 1:
+            return left_mean <= right_mean
+        return left_mean >= right_mean
+
+    def _mono_register_split(self, old_leaf, new_branch, new_leaves, split_decision):
+        """Feed a newly assembled split into the monotonic coordinator."""
+        left_leaf, right_leaf = new_leaves[0], new_leaves[-1]
+        self._mono_coordinator.split_leaf(
+            parent=old_leaf,
+            left_leaf=left_leaf,
+            right_leaf=right_leaf,
+            feature=split_decision.feature,
+            threshold=split_decision.split_info,
+        )
+        self._mono_mark_structure_change()
+
+    def _mono_reconcile(self):
+        """Re-solve the monotonic program only when the current sample requires it.
+
+        A coordination run is needed when the tree topology changed (the coordinator
+        already ran inside the split hook) or when a touched leaf's raw mean escaped its
+        cached feasible interval. Plain samples that stay inside the cached intervals cost
+        a single bounds lookup per touched leaf and never trigger a full-tree pass.
+        """
+        if self._mono_structure_dirty:
+            # The split hook already coordinated; nothing else to do.
+            return
+        coordinator = self._mono_coordinator
+        for leaf in self._mono_touched_leaves:
+            if leaf in coordinator._bounds and coordinator.needs_coordination(
+                leaf, leaf.stats.mean.get()
+            ):
+                coordinator.coordinate()
+                return

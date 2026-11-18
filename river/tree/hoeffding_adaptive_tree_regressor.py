@@ -19,6 +19,7 @@ from .nodes.hatr_nodes import (
     AdaNumBinaryBranchReg,
     AdaNumMultiwayBranchReg,
 )
+from .nodes.mono_hatr_nodes import MonoAdaLeafRegMean
 from .splitter import Splitter
 
 
@@ -96,6 +97,24 @@ class HoeffdingAdaptiveTreeRegressor(HoeffdingTreeRegressor):
         If True, enable merit-based tree pre-pruning.
     seed
        Random seed for reproducibility.
+    monotonic_cst
+        Feature-wise monotonic constraints. A mapping from feature names to one of the
+        Python integers ``-1``, ``0`` or ``1`` (booleans are not accepted):
+
+        - ``1`` forces a non-decreasing relationship between the feature and the
+          prediction,
+        - ``-1`` forces a non-increasing relationship,
+        - ``0`` leaves the feature unconstrained.
+
+        ``None``, an empty mapping or an all-zero mapping keep the tree unconstrained.
+        When at least one constraint is active, only ``leaf_prediction='mean'`` and
+        ``binary_split=True`` are supported. The monotonic semantics also govern the
+        adaptive behavior: alternate subtrees are trained with the same feasible
+        intervals as the main tree, participate in public predictions only through
+        monotonic-compatible values, and root/internal replacements are coordinated so
+        that the partial order holds before and after every switch. Drift detection is
+        never disabled; instead, the whole prediction surface may shift level when new
+        data justifies it.
 
     Notes
     -----
@@ -167,6 +186,7 @@ class HoeffdingAdaptiveTreeRegressor(HoeffdingTreeRegressor):
         remove_poor_attrs: bool = False,
         merit_preprune: bool = True,
         seed: int | None = None,
+        monotonic_cst: dict | None = None,
     ):
         super().__init__(
             grace_period=grace_period,
@@ -185,6 +205,7 @@ class HoeffdingAdaptiveTreeRegressor(HoeffdingTreeRegressor):
             stop_mem_management=stop_mem_management,
             remove_poor_attrs=remove_poor_attrs,
             merit_preprune=merit_preprune,
+            monotonic_cst=monotonic_cst,
         )
 
         self.bootstrap_sampling = bootstrap_sampling
@@ -229,17 +250,43 @@ class HoeffdingAdaptiveTreeRegressor(HoeffdingTreeRegressor):
         return summ
 
     def learn_one(self, x, y, *, w=1.0):
+        if self._mono_active:
+            # Validate before touching any state; zero-weight samples are no-ops.
+            from .monotonic import validate_learn_input
+
+            validate_learn_input(x, y, w, self._monotonic_cst)
+            if w == 0.0:
+                return
+            self._mono_touched_leaves = []
+            self._mono_structure_dirty = False
+
         self._train_weight_seen_by_model += w
 
         if self._root is None:
             self._root = self._new_leaf()
             self._n_active_leaves = 1
+            if self._mono_active:
+                # The first root leaf spans the whole, unconstrained region (component 0).
+                self._mono_coordinator.register_leaf(self._root)
+                self._mono_mark_structure_change()
         self._root.learn_one(x, y, w=w, tree=self)
+
+        if self._mono_active:
+            # Reconcile first: switches/prunes inside the traversal may have retired whole
+            # subtrees, and new leaves (including alternates) must be part of the graph.
+            self.mono_reconcile_live_leaves()
+            # Then re-solve only if a touched mean escaped its cached interval.
+            self._mono_reconcile()
 
         if self._train_weight_seen_by_model % self.memory_estimate_period == 0:
             self._estimate_model_size()
 
     def predict_one(self, x):
+        if self._mono_active:
+            from .monotonic import validate_predict_input
+
+            validate_predict_input(x, self._monotonic_cst)
+
         pred = 0.0
         if self._root is not None:
             found_nodes = [self._root]
@@ -251,6 +298,67 @@ class HoeffdingAdaptiveTreeRegressor(HoeffdingTreeRegressor):
             pred /= len(found_nodes)
 
         return pred
+
+    # ------------------------------------------------------------------
+    # Monotonic constraint hooks for the adaptive lifecycle
+    # ------------------------------------------------------------------
+    def _mono_main_leaves(self, root):
+        """Leaves of a subtree, ignoring alternate trees attached to its branches."""
+        if isinstance(root, DTBranch):
+            leaves = []
+            for child in root.children:
+                leaves.extend(self._mono_main_leaves(child))
+            return leaves
+        return [root]
+
+    def _mono_live_leaves(self):
+        """All leaves that may participate in a prediction: main tree and live alternates."""
+
+        def walk(node):
+            if isinstance(node, DTBranch):
+                found = []
+                for child in node.children:
+                    found.extend(walk(child))
+                if node._alternate_tree is not None:
+                    found.extend(walk(node._alternate_tree))
+                return found
+            return [node]
+
+        return walk(self._root)
+
+    def mono_reconcile_live_leaves(self):
+        """Drop coordinator entries for leaves that disappeared from the tree.
+
+        Nested switches and pruning (``kill_tree_children``) can retire whole subtrees in a
+        single sample; reconciling against the actual tree guarantees the coordinator only
+        ever retains state proportional to the live main tree plus its live alternates. The
+        full-tree walk only runs on samples where a structural event actually happened.
+        """
+        if not self._mono_structure_dirty:
+            return
+        live = set(self._mono_live_leaves())
+        stale = [leaf for leaf in self._mono_coordinator._boxes if leaf not in live]
+        if stale:
+            self._mono_coordinator.forget_subtree(stale)
+        # Newly appeared leaves (alternate roots, split children) are registered by their
+        # own lifecycle hooks and already coordinated there.
+
+    def mono_register_alternate_root(self, branch, alternate_leaf):
+        """Register a freshly created alternate subtree leaf with the coordinator.
+
+        The alternate gets its own component and starts covering exactly the branch
+        region. Because public predictions average this leaf with the branch's main
+        leaves, explicit tie pairs keep it consistent with each main leaf of the branch
+        until the alternate grows its own split structure.
+        """
+        coordinator = self._mono_coordinator
+        component = coordinator.new_component()
+        hull = coordinator.hull_box(self._mono_main_leaves(branch))
+        coordinator.register_leaf(alternate_leaf, box=hull, component=component)
+        for main_leaf in self._mono_main_leaves(branch):
+            coordinator.add_tie(alternate_leaf, main_leaf)
+        coordinator.coordinate()
+        self._mono_mark_structure_change()
 
     def _new_leaf(self, initial_stats=None, parent=None, is_active=True):
         """Create a new learning node.
@@ -273,6 +381,14 @@ class HoeffdingAdaptiveTreeRegressor(HoeffdingTreeRegressor):
                     leaf_model = deepcopy(self.leaf_model)
 
         if self.leaf_prediction == self._TARGET_MEAN:
+            if self._mono_active:
+                return MonoAdaLeafRegMean(
+                    initial_stats,
+                    depth,
+                    self.splitter,
+                    drift_detector=self.drift_detector.clone(),
+                    rng=self._rng,
+                )
             return AdaLeafRegMean(
                 initial_stats,
                 depth,

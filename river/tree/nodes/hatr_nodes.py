@@ -177,6 +177,9 @@ class AdaBranchRegressor(DTBranch):
             self._alternate_tree = tree._new_leaf(parent=self)
             self._alternate_tree.depth -= 1  # To ensure we do not skip a tree level
             tree._n_alternate_trees += 1
+            if getattr(tree, "_mono_active", False):
+                # The alternate starts covering exactly the region of this branch.
+                tree.mono_register_alternate_root(self, self._alternate_tree)
         # Condition to replace alternate tree
         elif self._alternate_tree:
             alt_n = self._alternate_tree._error_tracker.mean.n
@@ -193,7 +196,13 @@ class AdaBranchRegressor(DTBranch):
                 cur_s2_er = self._error_tracker.get()
 
                 # Perform z-test to determine whether mean errors are significantly different
-                z = (alt_mean_er - cur_mean_er) / math.sqrt(alt_s2_er / alt_n + cur_s2_er / cur_n)
+                denominator = math.sqrt(alt_s2_er / alt_n + cur_s2_er / cur_n)
+                if denominator > 0.0:
+                    z = (alt_mean_er - cur_mean_er) / denominator
+                else:
+                    # Both error distributions are concentrated on a point: the sign of the
+                    # mean difference is itself a sufficient test statistic.
+                    z = math.copysign(float("inf"), alt_mean_er - cur_mean_er)
                 # We double the p-value due to the double-tailed test
                 p_value = 2.0 * tree._norm_dist.cdf(-abs(z))
 
@@ -203,6 +212,8 @@ class AdaBranchRegressor(DTBranch):
                     if alt_mean_er < cur_mean_er:
                         tree._n_active_leaves -= self.n_leaves
                         tree._n_active_leaves += self._alternate_tree.n_leaves
+                        if getattr(tree, "_mono_active", False):
+                            tree._mono_mark_structure_change()
                         self.kill_tree_children(tree)
 
                         if parent is not None:
@@ -215,7 +226,11 @@ class AdaBranchRegressor(DTBranch):
                     # The current subtree yields the best results
                     else:
                         if isinstance(self._alternate_tree, DTBranch):
+                            if getattr(tree, "_mono_active", False):
+                                tree._mono_mark_structure_change()
                             self._alternate_tree.kill_tree_children(tree)  # noqa
+                        elif getattr(tree, "_mono_active", False):
+                            tree._mono_mark_structure_change()
                         self._alternate_tree = None
                         tree._n_pruned_alternate_trees += 1
 
@@ -277,6 +292,8 @@ class AdaBranchRegressor(DTBranch):
             # Delete alternate tree if it exists
             if isinstance(child, DTBranch):
                 if child._alternate_tree:
+                    if getattr(tree, "_mono_active", False):
+                        tree._mono_mark_structure_change()
                     child._alternate_tree.kill_tree_children(tree)
                     tree._n_pruned_alternate_trees += 1
                     child._alternate_tree = None

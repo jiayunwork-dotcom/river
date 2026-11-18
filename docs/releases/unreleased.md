@@ -29,3 +29,18 @@
 - `progressive_val_score` and `iter_progressive_val_score` gained the `feature_view`
   parameter described above. Both now release any pending contexts and close the input
   iterator when they finish, fail, or are closed explicitly.
+
+## tree
+
+- `HoeffdingTreeRegressor` and `HoeffdingAdaptiveTreeRegressor` accept a
+  `monotonic_cst` mapping enforcing non-decreasing (`1`) or non-increasing (`-1`)
+  predictions along selected features, for example `monotonic_cst={"income": 1,
+  "debt": -1}`. Constraints require `leaf_prediction="mean"` and `binary_split=True`;
+  other combinations, non-integer directions, booleans, and nominal-attribute
+  conflicts raise `ValueError` before training. Constrained leaves keep learning their
+  running means, while an isotonic coordinator projects each prediction onto a feasible
+  interval derived from a graph of region-ordering and adaptive-tree tie constraints.
+  The adaptive tree's drift detection, alternate-subtree training, switches and pruning
+  remain active, and the partial order is preserved across every subtree replacement.
+  Neutral configurations (`None`, an empty mapping, or all-zero directions) keep the
+  original unconstrained behavior and structure.
